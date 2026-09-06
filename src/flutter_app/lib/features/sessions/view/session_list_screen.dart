@@ -141,11 +141,20 @@ class _SessionListScreenState extends ConsumerState<SessionListScreen> {
     );
     if (pickedPath == null || !mounted) return;
 
-    final session = await ref.read(sessionListProvider.notifier).createSession(pickedPath);
-    if (session == null && mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Failed to create session — daemon may be disconnected')),
-      );
+    try {
+      await ref.read(sessionListProvider.notifier).createSession(pickedPath);
+    } on SessionCreateException catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to create session — ${e.message}')),
+        );
+      }
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Failed to create session — daemon may be disconnected')),
+        );
+      }
     }
   }
 

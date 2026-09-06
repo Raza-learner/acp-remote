@@ -1,12 +1,11 @@
-name = "runmote"
+name = "runmote-scripts"
 main = "worker.js"
 compatibility_date = "2026-07-10"
 
-# Routes
-#   runmote.dev/install.sh       -> main branch
-#   runmote.dev/install          -> main branch
-#   runmote.dev/install.sh/dev   -> dev branch
-#   runmote.dev/install/dev      -> dev branch
+routes = [
+  { pattern = "runmote.dev/install*", zone_name = "runmote.dev" },
+  { pattern = "runmote.dev/install.ps1*", zone_name = "runmote.dev" }
+]
 
 # Keep Render free-tier relays awake (sleep after 15 min inactivity)
 [triggers]

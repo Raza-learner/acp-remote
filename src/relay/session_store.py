@@ -46,10 +46,14 @@ class SessionStore:
         cwd: str = "",
         agent_id: str = "",
         updated_at: float | None = None,
+        daemon_id: str = "",
     ) -> None:
         now = time.time()
         display_name = name or f"Session {time.strftime('%H:%M')}"
         timestamp = updated_at or now
+        # Explicit daemon_id wins (multi-daemon relay); fall back to the
+        # legacy global for single-daemon backwards compatibility.
+        effective_daemon = daemon_id or self._daemon_id
         self._sessions[session_id] = {
             "sessionId": session_id,
             "id": session_id,
@@ -58,13 +62,13 @@ class SessionStore:
             "title": display_name,
             "cwd": cwd,
             "agentId": agent_id,
-            "daemonId": self._daemon_id,
+            "daemonId": effective_daemon,
             "createdAt": timestamp,
             "updatedAt": timestamp,
         }
         if self._db:
             try:
-                self._db.insert_session(session_id, client_id, agent_id, display_name, self._daemon_id, timestamp, cwd)
+                self._db.insert_session(session_id, client_id, agent_id, display_name, effective_daemon, timestamp, cwd)
             except Exception as e:
                 print(f"DB write failed: {e}")
 
@@ -103,10 +107,15 @@ class SessionStore:
             return True
         return False
 
-    def list_sessions(self, agent_id: str = "") -> list[dict]:
-        if not agent_id:
-            return list(self._sessions.values())
-        return [session for session in self._sessions.values() if session.get("agentId") == agent_id]
+    def list_sessions(self, agent_id: str = "", daemon_id: str = "") -> list[dict]:
+        result = list(self._sessions.values())
+        if agent_id:
+            result = [s for s in result if s.get("agentId") == agent_id]
+        if daemon_id:
+            # Scope to a single PC/daemon so sessions from a different PC
+            # never leak into another PC's session/list response.
+            result = [s for s in result if s.get("daemonId") in ("", daemon_id)]
+        return result
 
     def get(self, session_id: str) -> dict | None:
         return self._sessions.get(session_id)

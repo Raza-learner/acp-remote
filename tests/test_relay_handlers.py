@@ -62,7 +62,7 @@ class TestRegisterSession:
         session = {"sessionId": "s1", "name": "Test", "cwd": "/home", "agentId": "a1"}
         mod._register_session(session)
         mod.state.store.register.assert_called_once_with(
-            "s1", client_id="", name="Test", cwd="/home", agent_id="a1", updated_at=None
+            "s1", client_id="", name="Test", cwd="/home", agent_id="a1", updated_at=None, daemon_id=""
         )
 
     def test_register_with_id_fallback(self):
@@ -70,7 +70,7 @@ class TestRegisterSession:
         session = {"id": "s1", "title": "Test"}
         mod._register_session(session)
         mod.state.store.register.assert_called_once_with(
-            "s1", client_id="", name="Test", cwd="", agent_id="", updated_at=None
+            "s1", client_id="", name="Test", cwd="", agent_id="", updated_at=None, daemon_id=""
         )
 
     def test_register_empty_sid_returns_empty(self):
@@ -90,7 +90,7 @@ class TestRegisterSession:
         session = {"sessionId": "s1", "name": "Test", "updatedAt": 1234567890}
         mod._register_session(session)
         mod.state.store.register.assert_called_once_with(
-            "s1", client_id="", name="Test", cwd="", agent_id="", updated_at=1234567890
+            "s1", client_id="", name="Test", cwd="", agent_id="", updated_at=1234567890, daemon_id=""
         )
 
     def test_register_with_created_at_fallback(self):
@@ -98,7 +98,7 @@ class TestRegisterSession:
         session = {"sessionId": "s1", "name": "Test", "createdAt": 1000000000}
         mod._register_session(session)
         mod.state.store.register.assert_called_once_with(
-            "s1", client_id="", name="Test", cwd="", agent_id="", updated_at=1000000000
+            "s1", client_id="", name="Test", cwd="", agent_id="", updated_at=1000000000, daemon_id=""
         )
 
     def test_register_non_numeric_updated_at(self):
@@ -106,7 +106,15 @@ class TestRegisterSession:
         session = {"sessionId": "s1", "name": "Test", "updatedAt": "not-a-number"}
         mod._register_session(session)
         mod.state.store.register.assert_called_once_with(
-            "s1", client_id="", name="Test", cwd="", agent_id="", updated_at=None
+            "s1", client_id="", name="Test", cwd="", agent_id="", updated_at=None, daemon_id=""
+        )
+
+    def test_register_passes_daemon_id(self):
+        mod = self._import()
+        session = {"sessionId": "s1", "name": "Test"}
+        mod._register_session(session, daemon_id="pc-a")
+        mod.state.store.register.assert_called_once_with(
+            "s1", client_id="", name="Test", cwd="", agent_id="", updated_at=None, daemon_id="pc-a"
         )
 
 

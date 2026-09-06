@@ -29,34 +29,7 @@ export default {
       })
     }
 
-    // Site: proxy apex (and all non-install) to Vercel — DNS stays on Worker
-    // Default to www.runmote.dev (after DNS CNAME to Vercel) — falls back to vercel.app preview if needed
-    const vercelOrigin = env.VERCEL_ORIGIN || 'https://www.runmote.dev'
-    const target = new URL(url.pathname + url.search, vercelOrigin)
-    try {
-      const proxied = await fetch(new Request(target, {
-        method: req.method,
-        headers: req.headers,
-        body: req.body,
-        redirect: 'manual',
-      }))
-      // www not yet Valid → Vercel 525/404/308 → fallback to simple HTML until DNS is Valid
-      if (proxied.status !== 200) {
-        throw new Error(`proxy status ${proxied.status}`)
-      }
-      const h = new Headers(proxied.headers)
-      h.set('x-runmote-proxy', 'vercel')
-      if (!h.get('cache-control')) h.set('cache-control', 'public, max-age=60')
-      return new Response(proxied.body, { status: proxied.status, headers: h })
-    } catch (e) {
-      // Fallback: minimal HTML until www DNS is Valid
-      const html = `<!DOCTYPE html>
-<h1>Runmote</h1>
-<p>Site deploying to Vercel — check <a href="https://www.runmote.dev">www.runmote.dev</a> (DNS updating) or <a href="https://${new URL(vercelOrigin).host}">Vercel preview</a></p>
-<p>Install: <code>curl -fsSL https://runmote.dev/install.sh | bash</code></p>
-<p>Windows: <code>powershell -c "irm https://runmote.dev/install.ps1 | iex"</code></p>`
-      return new Response(html, { headers: { 'content-type': 'text/html;charset=utf-8', 'x-runmote-proxy': 'fallback' } })
-    }
+    return new Response('Not found', { status: 404 })
   },
 
   // Keep Render free-tier relays awake (sleep after 15 min inactivity)

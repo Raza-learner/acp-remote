@@ -70,7 +70,7 @@ class AppDatabase extends _$AppDatabase {
   }
 
   @override
-  int get schemaVersion => 2;
+  int get schemaVersion => 3;
 
   @override
   MigrationStrategy get migration {
@@ -79,6 +79,12 @@ class AppDatabase extends _$AppDatabase {
         if (from < 2) {
           // v2: clear session cache so existing cross-agent cached sessions
           // are reloaded cleanly with the new agent-aware relay logic.
+          await delete(sessionCache).go();
+        }
+        if (from < 3) {
+          // v3: clear session cache once so sessions leaked from a different
+          // PC (via the shared relay store) are evicted. The relay now
+          // scopes session/list per daemon, so the list repopulates cleanly.
           await delete(sessionCache).go();
         }
       },

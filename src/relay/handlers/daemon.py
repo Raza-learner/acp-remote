@@ -20,7 +20,7 @@ def _paired_clients(session: state.DaemonSession):
             yield cid, ws
 
 
-def _register_session(session: dict) -> str:
+def _register_session(session: dict, daemon_id: str = "") -> str:
     sid = session.get("sessionId") or session.get("id") or ""
     if not sid:
         return ""
@@ -41,6 +41,7 @@ def _register_session(session: dict) -> str:
         cwd=cwd,
         agent_id=session.get("agentId", ""),
         updated_at=updated_at,
+        daemon_id=daemon_id or session.get("daemonId", ""),
     )
     return sid
 
@@ -162,7 +163,8 @@ async def daemon_endpoint(websocket: WebSocket):
 
                 result = data.get("result")
                 if isinstance(result, dict):
-                    sid = _register_session(result)
+                    owner = session.daemon_id if session else ""
+                    sid = _register_session(result, daemon_id=owner)
 
                     sessions = result.get("sessions")
                     if isinstance(sessions, list):
@@ -171,7 +173,7 @@ async def daemon_endpoint(websocket: WebSocket):
                                 sid = s.get("sessionId") or s.get("id") or ""
                                 if state.store.is_deleted(sid):
                                     continue
-                                _register_session(s)
+                                _register_session(s, daemon_id=owner)
 
                 error = data.get("error")
                 if isinstance(error, dict):
@@ -216,7 +218,10 @@ async def daemon_endpoint(websocket: WebSocket):
                                 s.get("sessionId") or s.get("id") or "" for s in filtered if isinstance(s, dict)
                             }
                             if result_agent_id:
-                                for cs in state.store.list_sessions(agent_id=result_agent_id):
+                                for cs in state.store.list_sessions(
+                                    agent_id=result_agent_id,
+                                    daemon_id=session.daemon_id,
+                                ):
                                     if cs["sessionId"] not in agent_sids and not state.store.is_deleted(
                                         cs["sessionId"]
                                     ):

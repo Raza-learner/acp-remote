@@ -316,6 +316,116 @@ class TestAgentProcess:
             assert cmd_no_wrap == [r"C:\bin\opencode", "acp"]
 
 
+_FAKE_AGENT_WITH_AUTH = """
+import json, sys
+log = open(sys.argv[1], "a")
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    log.write(msg.get("method", "") + "\\n")
+    log.flush()
+    mid = msg.get("id")
+    if msg.get("method") == "initialize":
+        resp = {"jsonrpc": "2.0", "id": mid, "result": {
+            "protocolVersion": 1,
+            "agentCapabilities": {},
+            "authMethods": [{"id": "test_login", "name": "T", "description": "d"}],
+            "agentInfo": {"name": "Fake", "version": "9"},
+        }}
+    elif msg.get("method") == "authenticate":
+        assert msg["params"]["methodId"] == "test_login", msg.get("params")
+        resp = {"jsonrpc": "2.0", "id": mid, "result": {}}
+    else:
+        resp = {"jsonrpc": "2.0", "id": mid, "result": {"sessions": []}}
+    sys.stdout.write(json.dumps(resp) + "\\n")
+    sys.stdout.flush()
+"""
+
+_FAKE_AGENT_NO_AUTH = """
+import json, sys
+log = open(sys.argv[1], "a")
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    log.write(msg.get("method", "") + "\\n")
+    log.flush()
+    mid = msg.get("id")
+    if msg.get("method") == "initialize":
+        resp = {"jsonrpc": "2.0", "id": mid, "result": {
+            "protocolVersion": 1,
+            "agentCapabilities": {},
+            "agentInfo": {"name": "Fake", "version": "1"},
+        }}
+    else:
+        resp = {"jsonrpc": "2.0", "id": mid, "result": {"sessions": []}}
+    sys.stdout.write(json.dumps(resp) + "\\n")
+    sys.stdout.flush()
+"""
+
+
+class TestAgentStartAuth:
+    def _start(self, script_body, tmp_path, agent_id="cursor"):
+        import asyncio
+
+        async def main():
+            script = tmp_path / "fake_agent.py"
+            script.write_text(script_body)
+            seen = tmp_path / "methods.log"
+            seen.write_text("")
+            config = {
+                "id": agent_id,
+                "name": "Cursor",
+                "command": [sys.executable, str(script), str(seen)],
+            }
+            agent = AgentProcess(config)
+            await agent.start()
+            try:
+                # Snapshot online/info before stop() tears the process down.
+                return agent, seen.read_text().split(), agent.online
+            finally:
+                await agent.stop()
+
+        # Single event loop: subprocess transports are loop-bound.
+        return asyncio.run(main())
+
+    def test_authenticates_when_auth_methods_offered(self, tmp_path):
+        agent, methods, was_online = self._start(_FAKE_AGENT_WITH_AUTH, tmp_path)
+        assert was_online is True
+        assert methods[:3] == ["initialize", "authenticate", "session/list"]
+        # Daemon-configured display name wins; version captured.
+        assert agent.info == {"name": "Cursor", "version": "9"}
+
+    def test_skips_authenticate_when_no_auth_methods(self, tmp_path):
+        agent, methods, was_online = self._start(_FAKE_AGENT_NO_AUTH, tmp_path)
+        assert was_online is True
+        assert methods[:2] == ["initialize", "session/list"]
+        assert "authenticate" not in methods
+
+    def test_read_response_times_out(self):
+        import asyncio
+
+        async def main():
+            config = {
+                "id": "quiet",
+                "command": [sys.executable, "-c", "import time; time.sleep(30)"],
+            }
+            agent = AgentProcess(config)
+            # start() waits 10s for the missing initialize response, then
+            # proceeds — startup must not hang forever on a quiet agent.
+            await agent.start()
+            try:
+                with pytest.raises(TimeoutError):
+                    await agent._read_response("never", timeout=0.3)
+            finally:
+                await agent.stop()
+
+        asyncio.run(main())
+
+
 class TestIsHidden:
     def test_dot_prefix_is_hidden(self):
         entry = mock.MagicMock(spec=os.DirEntry)

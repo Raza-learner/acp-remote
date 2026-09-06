@@ -155,3 +155,20 @@ class TestDaemonId:
 
     def test_default_empty(self, store):
         assert store.get_daemon_id() == ""
+
+    def test_register_with_explicit_daemon_id(self, store):
+        store.register("s1", agent_id="a1", daemon_id="pc-a")
+        assert store.get("s1")["daemonId"] == "pc-a"
+
+    def test_list_filtered_by_daemon_id(self, store):
+        store.register("s1", agent_id="a1", daemon_id="pc-a")
+        store.register("s2", agent_id="a1", daemon_id="pc-b")
+        sessions = store.list_sessions(agent_id="a1", daemon_id="pc-a")
+        assert len(sessions) == 1
+        assert sessions[0]["sessionId"] == "s1"
+
+    def test_list_daemon_id_does_not_leak_other_pc(self, store):
+        store.register("s1", agent_id="a1", daemon_id="pc-a")
+        store.register("s2", agent_id="a1", daemon_id="pc-b")
+        sessions = store.list_sessions(agent_id="a1", daemon_id="pc-b")
+        assert {s["sessionId"] for s in sessions} == {"s2"}

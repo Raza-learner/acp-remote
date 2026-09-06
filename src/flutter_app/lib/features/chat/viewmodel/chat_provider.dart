@@ -569,10 +569,13 @@ class ChatNotifier extends StateNotifier<AsyncValue<ChatState>> {
       case 'user_message_chunk':
         _finalizeStreaming();
         _upsertMessage(text, ChatMessageRole.user, msgId);
+        break;
       case 'agent_message_chunk':
         _upsertMessage(text, ChatMessageRole.assistant, msgId);
+        break;
       case 'agent_thought_chunk':
         _addThoughtChunk(text);
+        break;
       case 'tool_call':
         _ensureAssistantMessage();
         _addSegment(
@@ -580,6 +583,7 @@ class ChatNotifier extends StateNotifier<AsyncValue<ChatState>> {
           update['title'] as String? ?? 'tool call',
           update['toolCallId'] as String? ?? '',
         );
+        break;
       case 'tool_call_update':
         final toolOut = update['content'] as List<dynamic>?;
         final textParts = <String>[];
@@ -606,6 +610,7 @@ class ChatNotifier extends StateNotifier<AsyncValue<ChatState>> {
         final toolStatus = update['status'] as String?;
         _updateToolOutput(toolId, outText, toolStatus,
             diffs: diffs, terminalId: terminalId);
+        break;
       case 'plan':
         _ensureAssistantMessage();
         _addSegment(
@@ -616,6 +621,7 @@ class ChatNotifier extends StateNotifier<AsyncValue<ChatState>> {
               'plan',
           '',
         );
+        break;
       case 'config_option_update':
         final configs = update['configOptions'] as List<dynamic>?;
         if (configs != null) {
@@ -625,6 +631,7 @@ class ChatNotifier extends StateNotifier<AsyncValue<ChatState>> {
                 .toList(),
           );
         }
+        break;
       case 'available_commands_update':
         final raw = update['availableCommands'] as List<dynamic>?;
         if (raw != null) {
@@ -633,6 +640,7 @@ class ChatNotifier extends StateNotifier<AsyncValue<ChatState>> {
               .toList();
           if (_loaded) _syncState();
         }
+        break;
       case 'usage_update':
         break;
       default:

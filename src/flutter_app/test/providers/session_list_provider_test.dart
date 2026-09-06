@@ -230,8 +230,10 @@ void main() {
       // Set channel to null
       mock.state = mock.state.copyWith(clearChannel: true);
 
-      final session = await container.read(sessionListProvider.notifier).createSession('/home');
-      expect(session, isNull);
+      await expectLater(
+        container.read(sessionListProvider.notifier).createSession('/home'),
+        throwsA(isA<SessionCreateException>()),
+      );
       container.dispose();
     });
 
@@ -356,9 +358,8 @@ void main() {
 
       // Simulate error — no result key
       mock.respond({'error': 'failed'});
-      final session = await future;
 
-      expect(session, isNull);
+      await expectLater(future, throwsA(isA<SessionCreateException>()));
       container.dispose();
     });
 

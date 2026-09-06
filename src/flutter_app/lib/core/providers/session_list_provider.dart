@@ -263,7 +263,15 @@ class SessionListNotifier extends StateNotifier<AsyncValue<List<AcpSession>>> {
       // list is never empty while waiting for the remote response and
       // so switching agents immediately clears stale sessions from the
       // previous agent.
-      final cachedRows = await db.getCachedSessions(pairingCode);
+      var cachedRows = await db.getCachedSessions(pairingCode);
+      // Fallback to legacy cache key (without :agentId suffix) so opencode
+      // sessions created before per-agent caching are still visible.
+      if (cachedRows.isEmpty && pairingCode.contains(':')) {
+        final legacyCode = pairingCode.split(':').first;
+        if (legacyCode.isNotEmpty && legacyCode != pairingCode) {
+          cachedRows = await db.getCachedSessions(legacyCode);
+        }
+      }
       final cachedSessions = cachedRows
           .map((s) => AcpSession(
                 id: s.id,
@@ -347,11 +355,14 @@ class SessionListNotifier extends StateNotifier<AsyncValue<List<AcpSession>>> {
       // knows about. Keep cached-only sessions (e.g. created on this phone).
       final remoteSessions = rawSessions
           .where((s) => !_deletedIds.contains(s.id))
-          // Defensive filter: ignore sessions the relay tagged for a different
-          // agent. This prevents cross-agent session leakage if the relay ever
-          // forwards a mixed list. Only show agentless sessions when no
-          // specific agent is selected.
-          .where((s) => selectedAgentId == null ? true : s.agentId == selectedAgentId)
+          // Defensive filter: ignore sessions tagged for a different agent.
+          // Allow null/empty agentId through (opencode and older daemons may
+          // omit the tag, and strict filtering would hide all sessions).
+          .where((s) =>
+              selectedAgentId == null ||
+              s.agentId == null ||
+              s.agentId!.isEmpty ||
+              s.agentId == selectedAgentId)
           .toList();
 
       // Preserve very recent local sessions while refreshing so a newly
@@ -399,94 +410,113 @@ class SessionListNotifier extends StateNotifier<AsyncValue<List<AcpSession>>> {
     }
   }
 
-  Future<AcpSession?> createSession(String cwd) async {
-    try {
-      final connection = _ref.read(connectionProvider);
-      if (connection.channel == null) {
-        return null;
-      }
+  /// Creates a session on the selected agent.
+  ///
+  /// Returns the new session, or throws [SessionCreateException] carrying
+  /// the agent's own error message (e.g. cursor's "Authentication required.
+  /// Please run 'agent login' first") so the UI can show it instead of a
+  /// generic "daemon may be disconnected" message.
+  Future<AcpSession> createSession(String cwd) async {
+    final connection = _ref.read(connectionProvider);
+    if (connection.channel == null) {
+      throw const SessionCreateException('Not connected to relay');
+    }
 
-      final notifier = _ref.read(connectionProvider.notifier);
+    final notifier = _ref.read(connectionProvider.notifier);
 
-      final completer = Completer<AcpSession?>();
-      int? requestId;
-      StreamSubscription<Map<String, dynamic>>? sub;
+    final completer = Completer<AcpSession>();
+    int? requestId;
+    StreamSubscription<Map<String, dynamic>>? sub;
 
-      sub = notifier.messages.listen((msg) {
-        if (msg['id'] == requestId) {
-          try {
-            final result = msg['result'] as Map<String, dynamic>?;
-            if (result != null) {
-              final sessionId = result['sessionId'] as String;
-              final title = (result['title'] ?? result['name']) as String?;
-              if (!completer.isCompleted) {
-                completer.complete(
-                  AcpSession(
-                    id: sessionId,
-                    title: title,
-                    cwd: cwd,
-                    updatedAt: DateTime.now().millisecondsSinceEpoch / 1000,
-                    agentId: connection.selectedAgentId,
-                  ),
-                );
-              }
-            } else {
-              if (!completer.isCompleted) {
-                completer.complete(null);
-              }
-            }
-          } catch (e) {
+    sub = notifier.messages.listen((msg) {
+      if (msg['id'] == requestId) {
+        try {
+          final result = msg['result'] as Map<String, dynamic>?;
+          if (result != null) {
+            final sessionId = result['sessionId'] as String;
+            final title = (result['title'] ?? result['name']) as String?;
             if (!completer.isCompleted) {
-              completer.complete(null);
+              completer.complete(
+                AcpSession(
+                  id: sessionId,
+                  title: title,
+                  cwd: cwd,
+                  updatedAt: DateTime.now().millisecondsSinceEpoch / 1000,
+                  agentId: connection.selectedAgentId,
+                ),
+              );
+            }
+          } else {
+            // Agent/daemon returned a JSON-RPC error — surface its message.
+            final error = msg['error'] as Map<String, dynamic>?;
+            final message = error?['message'] as String? ?? 'Unknown agent error';
+            final data = error?['data'];
+            final detail = data is Map && data['message'] is String
+                ? ' ${data['message']}'
+                : '';
+            if (!completer.isCompleted) {
+              completer.completeError(
+                SessionCreateException('$message$detail'),
+              );
             }
           }
+        } catch (e) {
+          if (!completer.isCompleted) {
+            completer.completeError(
+              e is SessionCreateException
+                  ? e
+                  : const SessionCreateException('Invalid response from agent'),
+            );
+          }
         }
-      });
+      }
+    });
 
-      requestId = _nextRequestId;
-      final prefs = await _ref.read(preferencesServiceProvider.future);
-      final mcps = prefs.getMcpServers().map((s) => s.toJson()).toList();
-      final payload = {
-        'jsonrpc': '2.0',
-        'id': requestId,
-        'method': 'session/new',
-        'params': {
-          if (connection.selectedAgentId != null)
-            'agentId': connection.selectedAgentId,
-          'cwd': cwd,
-          'mcpServers': mcps,
-        },
-      };
-      notifier.sendRaw(payload);
+    requestId = _nextRequestId;
+    final prefs = await _ref.read(preferencesServiceProvider.future);
+    final mcps = prefs.getMcpServers().map((s) => s.toJson()).toList();
+    final payload = {
+      'jsonrpc': '2.0',
+      'id': requestId,
+      'method': 'session/new',
+      'params': {
+        if (connection.selectedAgentId != null)
+          'agentId': connection.selectedAgentId,
+        'cwd': cwd,
+        'mcpServers': mcps,
+      },
+    };
+    notifier.sendRaw(payload);
 
+    try {
+      // Cold agent starts (npx adapters, cursor auth) can take a while —
+      // 5s was timing out healthy agents.
       final session = await completer.future.timeout(
-        const Duration(seconds: 5),
-        onTimeout: () => null,
+        const Duration(seconds: 30),
+        onTimeout: () => throw const SessionCreateException(
+          'Agent did not respond in 30s — it may still be starting. Try again.',
+        ),
       );
 
-      await sub.cancel();
-
-      if (session != null) {
-        final db = _ref.read(databaseProvider);
-        final code = _cacheDeviceCode(
-          connection.pairingCode ?? '',
-          connection.selectedAgentId,
-        );
-        await db.cacheSession(
-          id: session.id,
-          deviceCode: code,
-          title: session.title,
-          cwd: session.cwd,
-          updatedAt: session.updatedAt,
-        );
-        state.whenData((sessions) {
-          state = AsyncValue.data([...sessions, session]);
-        });
-      }
+      final db = _ref.read(databaseProvider);
+      final code = _cacheDeviceCode(
+        connection.pairingCode ?? '',
+        connection.selectedAgentId,
+      );
+      await db.cacheSession(
+        id: session.id,
+        deviceCode: code,
+        title: session.title,
+        cwd: session.cwd,
+        updatedAt: session.updatedAt,
+      );
+      state.whenData((sessions) {
+        state = AsyncValue.data([...sessions, session]);
+      });
 
       return session;
-    } catch (_) {
-      return null;
+    } finally {
+      await sub.cancel();
     }
   }
 
@@ -521,6 +551,17 @@ class SessionListNotifier extends StateNotifier<AsyncValue<List<AcpSession>>> {
 String _cacheDeviceCode(String pairingCode, String? agentId) {
   if (agentId == null || agentId.isEmpty) return pairingCode;
   return '$pairingCode:$agentId';
+}
+
+/// Thrown by [SessionListNotifier.createSession] when the agent or daemon
+/// rejects session creation. Carries the agent's own error message so the
+/// UI can display it instead of a generic failure notice.
+class SessionCreateException implements Exception {
+  final String message;
+  const SessionCreateException(this.message);
+
+  @override
+  String toString() => 'SessionCreateException: $message';
 }
 
 final sessionListProvider =

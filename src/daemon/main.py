@@ -164,14 +164,54 @@ class AgentProcess:
             **kwargs,
         )
         self.online = True
+        init_id = f"daemon_init_{self.id}"
         await self.send(
             {
                 "jsonrpc": "2.0",
                 "method": "initialize",
-                "id": f"daemon_init_{self.id}",
+                "id": init_id,
                 "params": {"protocolVersion": 1},
             }
         )
+        # Read the initialize response so agent info/capabilities are
+        # captured early and agents that gate every session/* call behind
+        # authenticate() (e.g. cursor-agent) can be authenticated now.
+        # Without this, cursor rejects session/new with "Authentication
+        # required" and the mobile app only sees a generic failure.
+        try:
+            init_resp = await self._read_response(init_id, timeout=10)
+        except Exception as e:
+            log("Agent %s: no initialize response (%s)", self.id, e)
+            init_resp = None
+        if isinstance(init_resp, dict):
+            _capture_agent_info(init_resp, self)
+            result = init_resp.get("result")
+            methods = result.get("authMethods") if isinstance(result, dict) else None
+            if isinstance(methods, list) and methods:
+                first = methods[0] if isinstance(methods[0], dict) else {}
+                method_id = first.get("id")
+                if method_id:
+                    auth_id = f"daemon_auth_{self.id}"
+                    try:
+                        await self.send(
+                            {
+                                "jsonrpc": "2.0",
+                                "method": "authenticate",
+                                "id": auth_id,
+                                "params": {"methodId": method_id},
+                            }
+                        )
+                        auth_resp = await self._read_response(auth_id, timeout=20)
+                        if isinstance(auth_resp, dict) and auth_resp.get("error"):
+                            log(
+                                "Agent %s: authenticate failed: %s",
+                                self.id,
+                                json.dumps(auth_resp.get("error"))[:200],
+                            )
+                        else:
+                            log("Agent %s: authenticated via %s", self.id, method_id)
+                    except Exception as e:
+                        log("Agent %s: authenticate failed (%s)", self.id, e)
         await self.send(
             {
                 "jsonrpc": "2.0",
@@ -181,6 +221,36 @@ class AgentProcess:
             }
         )
         log(f"Started {self.id}: {' '.join(self.command)}")
+
+    async def _read_response(self, expect_id: str, timeout: float = 10.0):
+        """Read stdout lines until the JSON-RPC response with *expect_id* arrives.
+
+        Other lines (notifications/updates) are logged and dropped — at
+        startup only our own handshake responses are expected. Raises
+        TimeoutError when the response does not arrive in time.
+        """
+        if not self.proc or not self.proc.stdout:
+            raise RuntimeError(f"agent {self.id} has no stdout")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise TimeoutError(f"agent {self.id}: no response to {expect_id}")
+            line = await asyncio.wait_for(self.proc.stdout.readline(), timeout=remaining)
+            if not line:
+                raise RuntimeError(f"agent {self.id} stdout closed")
+            raw = line.decode(errors="replace").strip()
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                log("%s startup: ignoring non-JSON output: %s", self.id, raw[:120])
+                continue
+            if data.get("id") == expect_id:
+                return data
+            log("%s startup: skipping message while waiting for %s", self.id, expect_id)
 
     async def send(self, message: dict):
         if not self.proc or not self.proc.stdin or self.proc.returncode is not None:
@@ -691,6 +761,22 @@ async def run_daemon():
                                 await send_queues[agent.id].put(_message_for_agent(data))
                             else:
                                 log("No send queue for %s, dropping message", agent.id)
+                                if msg_id is not None:
+                                    try:
+                                        await _send_json(
+                                            websocket,
+                                            {
+                                                "jsonrpc": "2.0",
+                                                "id": msg_id,
+                                                "error": {
+                                                    "code": -32005,
+                                                    "message": f"agent {agent.id} is not running",
+                                                    "data": {"agentId": agent.id},
+                                                },
+                                            },
+                                        )
+                                    except Exception:
+                                        pass
                     except asyncio.CancelledError:
                         log("relay_to_agents: cancelled")
                         raise
@@ -775,7 +861,37 @@ async def run_daemon():
                         message = await queue.get()
                         try:
                             await agent.send(message)
-                        except Exception:
+                        except Exception as exc:
+                            agent.online = False
+                            log("agent_sender %s: send failed (%s)", agent.id, exc)
+                            # Reply to the failed message and anything still
+                            # queued so the app gets an error instead of
+                            # hanging until its own timeout.
+                            pending = [message]
+                            while not queue.empty():
+                                try:
+                                    pending.append(queue.get_nowait())
+                                except asyncio.QueueEmpty:
+                                    break
+                            for msg in pending:
+                                mid = msg.get("id")
+                                if mid is None:
+                                    continue
+                                try:
+                                    await _send_json(
+                                        websocket,
+                                        {
+                                            "jsonrpc": "2.0",
+                                            "id": mid,
+                                            "error": {
+                                                "code": -32005,
+                                                "message": f"agent {agent.id} is not running",
+                                                "data": {"agentId": agent.id},
+                                            },
+                                        },
+                                    )
+                                except Exception:
+                                    pass
                             break
 
                 relay_task = asyncio.create_task(relay_to_agents())
