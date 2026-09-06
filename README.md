@@ -21,6 +21,12 @@
     <a href="https://github.com/Raza-learner/Runmote/stargazers"><img src="https://img.shields.io/github/stars/Raza-learner/Runmote?style=social" alt="Stars" /></a>
   </p>
 
+  <p>
+    Listed on the official
+    <a href="https://agentclientprotocol.com/get-started/clients#mobile-clients">ACP clients page</a>
+    as a verified mobile ACP client.
+  </p>
+
   <br />
   <img src="https://github.com/Raza-learner/Runmote/raw/main/assets/Runmote-demo.gif" alt="Runmote Demo" width="800" style="max-width:100%" />
   <br />
