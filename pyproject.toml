@@ -1,6 +1,6 @@
 [project]
 name = "acp"
-version = "1.0.1"
+version = "1.0.2"
 description = "Control any ACP-compatible AI coding agent on your PC from your phone — no SSH, no VPN, just a 6-digit pairing code."
 readme = "README.md"
 requires-python = ">=3.13"
