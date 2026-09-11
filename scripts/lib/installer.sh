@@ -276,9 +276,16 @@ install_dependencies() {
         return 1
     fi
 
-    # Recreate venv to avoid stale packages from previous installs
-    rm -rf .venv
-    "$uv_cmd" sync || return 1
+    # Don't nuke .venv: uv sync is idempotent and re-resolves staleness
+    # itself. Recreating forces a full Python + dependency re-download
+    # (minutes on slow links) on every reinstall. Set ACP_RECREATE_VENV=1
+    # for a clean rebuild when actually needed.
+    if [[ "${ACP_RECREATE_VENV:-0}" == 1 ]]; then
+        info "Recreating virtualenv (ACP_RECREATE_VENV=1)..."
+        rm -rf .venv
+    fi
+    # --frozen uses uv.lock: no resolution step, deterministic, faster.
+    "$uv_cmd" sync --frozen || "$uv_cmd" sync || return 1
     success "Dependencies installed"
 
     return 0

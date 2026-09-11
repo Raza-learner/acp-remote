@@ -29,14 +29,9 @@ case "$MODE" in
     *)         MODE="install" ;;
 esac
 
-# Prefer the npm package as the canonical path
-if command -v npx &>/dev/null; then
-    case "$MODE" in
-        install) npx -y runmote agents 2>/dev/null && exit 0 || true ;;
-        remove)  npx -y runmote uninstall 2>/dev/null && exit 0 || true ;;
-        status)  npx -y runmote status 2>/dev/null && exit 0 || true ;;
-    esac
-fi
+# NOTE: there is no `runmote` package on the npm registry (npx 404s),
+# so don't waste a registry round-trip here — go straight to local install.
+
 
 detect_os() {
     case "$(uname -s)" in
@@ -82,6 +77,22 @@ _ensure_npm() {
     fi
 }
 
+# Fast install check: `npm list -g` spawns the full npm machinery per
+# package (seconds each). A directory check under the global root is instant.
+_npm_global_root() {
+    if [[ -z "${_NPM_ROOT:-}" ]]; then
+        _NPM_ROOT="$(npm root -g 2>/dev/null || true)"
+    fi
+    printf '%s' "$_NPM_ROOT"
+}
+
+_is_pkg_installed() {
+    local pkg="$1"
+    local root
+    root="$(_npm_global_root)"
+    [[ -n "$root" && -d "$root/$pkg" ]]
+}
+
 _install_if_cli_found() {
     local cli="$1"
     local pkg="$2"
@@ -91,7 +102,7 @@ _install_if_cli_found() {
         return
     fi
 
-    if npm list -g "$pkg" &>/dev/null; then
+    if _is_pkg_installed "$pkg"; then
         echo "  $pkg already installed — skipping"
     else
         echo "  Installing $pkg (for $cli)..."
@@ -101,7 +112,7 @@ _install_if_cli_found() {
 
 _remove_package() {
     local pkg="$1"
-    if npm list -g "$pkg" &>/dev/null; then
+    if _is_pkg_installed "$pkg"; then
         echo "  Removing $pkg..."
         npm uninstall -g "$pkg"
     else
@@ -123,12 +134,16 @@ install_agents() {
         _install_if_cli_found "agy" "agy-acp" 2>/dev/null || \
             echo "  agy not found — skipping agy-acp"
     fi
-    # copilot — native ACP mode, install the CLI if missing
+    # copilot — native ACP mode. The CLI ships a bundled runtime
+    # (~100MB+ download), so only install it on explicit opt-in and never
+    # by default: it was the single slowest step for users who never use it.
     if command -v copilot &>/dev/null; then
         echo "  copilot already installed — skipping"
-    else
-        echo "  Installing GitHub Copilot CLI..."
+    elif [[ "${ACP_ENABLE_COPILOT:-false}" == true ]]; then
+        echo "  Installing GitHub Copilot CLI (ACP_ENABLE_COPILOT=true)..."
         npm install -g @github/copilot 2>/dev/null || echo "  Warning: copilot install failed"
+    else
+        echo "  copilot skipped (set ACP_ENABLE_COPILOT=true to install it)"
     fi
 
     _install_symlinks
@@ -175,10 +190,12 @@ status_agents() {
     done
 
     echo ""
+    local root
+    root="$(_npm_global_root)"
     for pkg in "agy-acp" "@github/copilot" "@agentclientprotocol/codex-acp" "@agentclientprotocol/claude-agent-acp"; do
-        if npm list -g "$pkg" &>/dev/null; then
+        if [[ -n "$root" && -d "$root/$pkg" ]]; then
             local ver
-            ver="$(npm list -g "$pkg" --depth=0 2>/dev/null | grep "$pkg" | sed 's/.*@//')"
+            ver="$(node -p "require('$root/$pkg/package.json').version" 2>/dev/null || echo '?')"
             echo "  $pkg: installed (v$ver)"
         else
             echo "  $pkg: not installed"
