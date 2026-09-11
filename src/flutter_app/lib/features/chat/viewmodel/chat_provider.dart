@@ -328,8 +328,10 @@ class ChatNotifier extends StateNotifier<AsyncValue<ChatState>> {
     }
     _loaded = true;
     if (_pendingConfigs != null) {
-      _syncConfigAndState(_pendingConfigs!);
+      final configs = _pendingConfigs!;
       _pendingConfigs = null;
+      _syncConfigAndState(configs);
+      unawaited(_reapplySavedConfigChoices(configs));
     } else {
       _syncState();
     }
@@ -466,9 +468,13 @@ class ChatNotifier extends StateNotifier<AsyncValue<ChatState>> {
           }
         }
 
-        // Detect JSON-RPC response to a pending request (prompt/load done)
+        // Detect JSON-RPC response to a pending request (prompt/load done).
+        // Capture membership BEFORE removal so the configOptions block below
+        // can tell whether a sessionId-less response answers OUR request.
         final msgId = msg['id'];
-        if (method == null && msgId != null && _pendingIds.remove(msgId)) {
+        final isOwnResponse = msgId != null && _pendingIds.contains(msgId);
+        if (method == null && isOwnResponse) {
+          _pendingIds.remove(msgId);
           _streamingTimer?.cancel();
           final wasLoad = msgId == _loadPendingId;
           if (wasLoad) {
@@ -519,11 +525,17 @@ class ChatNotifier extends StateNotifier<AsyncValue<ChatState>> {
         // Capture configOptions from session/new or session/load response.
         // Only process JSON-RPC responses (no method, has id) to prevent
         // notifications from accidentally setting config options.
+        // Strictly scoped: apply only when the response names OUR session,
+        // or when it answers one of OUR pending requests (some agents omit
+        // sessionId from new/load results). Otherwise one agent's models
+        // (e.g. opencode's) would leak into another agent's chat (e.g.
+        // cursor's), since all chats share this relay stream.
         final result = msg['result'] as Map<String, dynamic>?;
         if (method == null && result != null && result['configOptions'] is List) {
           final respSessionId = result['sessionId'] as String?;
-          // When sessionId is explicitly present and doesn't match, skip.
-          if (respSessionId != null && respSessionId != _sessionId) {
+          final belongsToUs = respSessionId == _sessionId ||
+              (respSessionId == null && isOwnResponse);
+          if (!belongsToUs) {
             return;
           }
           final configs = (result['configOptions'] as List<dynamic>)
@@ -531,6 +543,9 @@ class ChatNotifier extends StateNotifier<AsyncValue<ChatState>> {
               .toList();
           if (configs.isNotEmpty) {
             _setConfigOptions(configs);
+            // Fresh (default) configs from the agent would wipe the user's
+            // saved pick — re-apply it so the model choice sticks.
+            unawaited(_reapplySavedConfigChoices(configs));
           }
         }
       },
@@ -901,9 +916,67 @@ class ChatNotifier extends StateNotifier<AsyncValue<ChatState>> {
     });
   }
 
+  /// Agent that owns this session, for per-agent preference keys.
+  /// Falls back to the currently selected agent when the session list
+  /// doesn't know this session (e.g. tests).
+  String? get _agentIdForSession {
+    try {
+      final sessions = _ref.read(sessionListProvider).valueOrNull;
+      if (sessions != null) {
+        for (final s in sessions) {
+          if (s.id == _sessionId && s.agentId != null) return s.agentId;
+        }
+      }
+    } catch (_) {}
+    try {
+      return _ref.read(connectionProvider).selectedAgentId;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Re-send the user's saved config choices (e.g. model) when the agent
+  /// reports values that differ — e.g. defaults after a fresh load.
+  /// Only applies choices the agent still offers, so stale picks are
+  /// dropped silently instead of fighting the agent.
+  Future<void> _reapplySavedConfigChoices(List<ConfigOption> configs) async {
+    if (!_loaded || !_connected) return;
+    final agentId = _agentIdForSession;
+    if (agentId == null) return;
+    Map<String, String> saved;
+    try {
+      final prefs = await _ref.read(preferencesServiceProvider.future);
+      saved = prefs.getConfigChoices(agentId);
+    } catch (_) {
+      return;
+    }
+    if (saved.isEmpty || !mounted) return;
+    for (final entry in saved.entries) {
+      final opt = configs.where((c) => c.id == entry.key).firstOrNull;
+      if (opt == null) continue;
+      if (opt.currentValue == entry.value) continue;
+      if (!opt.options.any((o) => o.value == entry.value)) continue;
+      debugPrint(
+          '[chat_provider] re-applying saved ${opt.id}=${entry.value} for session=$_sessionId');
+      await setConfigOption(opt.id, entry.value);
+      if (!mounted) return;
+    }
+  }
+
   Future<void> setConfigOption(String configId, String value) async {
     final notifier = _ref.read(connectionProvider.notifier);
     final connection = _ref.read(connectionProvider);
+
+    // Persist per agent so the pick survives reloads/reconnects.
+    try {
+      final agentId = _agentIdForSession;
+      if (agentId != null) {
+        final prefs = await _ref.read(preferencesServiceProvider.future);
+        await prefs.setConfigChoice(agentId, configId, value);
+      }
+    } catch (e) {
+      debugPrint('[chat_provider] failed to persist config choice: $e');
+    }
 
     notifier.sendRaw({
       'jsonrpc': '2.0',

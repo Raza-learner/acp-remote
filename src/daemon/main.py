@@ -17,6 +17,7 @@ if str(_src) not in sys.path:
     sys.path.insert(0, str(_src))
 
 from config import get_agent_configs, DAEMON_ID, DAEMON_TOKEN, RECONNECT_DELAY, RELAY_URL
+from session_sources import list_local_sessions, merge_session_lists
 from websockets.asyncio.client import connect
 
 
@@ -369,6 +370,71 @@ def _tag_agent_response(message: dict, agent: AgentProcess, session_cwd: str = "
     return tagged
 
 
+# Pending session/list merges: request-id str -> entry dict with
+# {"agent", "local" (disk snapshot), "answered" (bool),
+#  "task" (fallback task), "id" (original request id)}.
+# Some agents advertise session/list but never answer it (opencode's ACP
+# silently drops the request), so the daemon merges the agent's live
+# answer — if any — with the on-disk session snapshot and replies once.
+_list_pending: dict[str, dict] = {}
+# Must stay well under the app's 5s session/list timeout (plus relay hop).
+_LIST_AGENT_TIMEOUT = 3.0
+
+
+async def _answer_list_request(websocket, key: str, live: list[dict] | None) -> bool:
+    """Send the single merged session/list response for *key*.
+
+    *live* is the agent's own session list, or None when the agent
+    errored/timed out (disk snapshot only). Returns True when this call
+    sent the response, False when another path already answered.
+    """
+    entry = _list_pending.pop(key, None)
+    if entry is None or entry.get("answered"):
+        return False
+    entry["answered"] = True
+    task = entry.get("task")
+    current = asyncio.current_task()
+    if task is not None and task is not current:
+        task.cancel()
+    agent = entry["agent"]
+    try:
+        merged = merge_session_lists(live, entry.get("local") or [], agent.id)
+    except Exception as e:
+        log("session/list: merge failed (%s), using disk snapshot", e)
+        merged = entry.get("local") or []
+    await _send_json(
+        websocket,
+        {
+            "jsonrpc": "2.0",
+            "id": entry["id"],
+            "result": {"sessions": merged, "agentId": agent.id},
+        },
+    )
+    return True
+
+
+async def _list_fallback(websocket, key: str):
+    """Answer a session/list request from disk when the agent stays silent."""
+    await asyncio.sleep(_LIST_AGENT_TIMEOUT)
+    entry = _list_pending.get(key)
+    if entry is None or entry.get("answered"):
+        return
+    agent = entry["agent"]
+    log(
+        "session/list: agent %s silent after %ss, answering from disk (%d sessions)",
+        agent.id,
+        _LIST_AGENT_TIMEOUT,
+        len(entry.get("local") or []),
+    )
+    try:
+        await _answer_list_request(websocket, key, None)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log("session/list: disk fallback failed (%s)", e)
+        _list_pending.pop(key, None)
+
+
 def _capture_agent_info(message: dict, agent: AgentProcess):
     result = message.get("result")
     if not isinstance(result, dict):
@@ -419,6 +485,16 @@ async def run_daemon():
                 close_timeout=10,
             ) as websocket:
                 log("Connected to relay!  (socket %#x)", ping_tag)
+
+                # Drop stale session/list merges from the previous
+                # connection — their fallback tasks reference a dead
+                # socket and their ids may be reused by the app.
+                if _list_pending:
+                    for stale in _list_pending.values():
+                        task = stale.get("task")
+                        if task is not None:
+                            task.cancel()
+                    _list_pending.clear()
 
                 identify_id = "daemon_ident"
                 await _send_json(
@@ -745,6 +821,28 @@ async def run_daemon():
                                 )
                                 continue
     
+                            # session/list gets a disk snapshot + merge: agents
+                            # may never answer (opencode) or error (method
+                            # not found), and the phone must still see the
+                            # sessions stored on this machine.
+                            if method == "session/list" and msg_id is not None:
+                                key = str(msg_id)
+                                try:
+                                    local = list_local_sessions(agent.id)
+                                except Exception as e:
+                                    log("session/list: disk snapshot failed (%s)", e)
+                                    local = []
+                                _list_pending[key] = {
+                                    "agent": agent,
+                                    "local": local,
+                                    "answered": False,
+                                    "task": None,
+                                    "id": msg_id,
+                                }
+                                _list_pending[key]["task"] = asyncio.create_task(
+                                    _list_fallback(websocket, key)
+                                )
+
                             # Save request info (cwd, method) keyed by message id.
                             # Used to inject cwd into the agent response and to
                             # handle method-level errors (e.g. session/close).
@@ -811,6 +909,26 @@ async def run_daemon():
                                 cwd = info.get("cwd", "")
                                 method = info.get("method", "")
                                 tagged = _tag_agent_response(data, agent, session_cwd=cwd, session_method=method)
+                                if method == "session/list" and req_id and req_id in _list_pending:
+                                    # Merge with the disk snapshot and reply
+                                    # once; a late agent answer after the
+                                    # disk fallback is dropped (already sent).
+                                    live = None
+                                    result = tagged.get("result")
+                                    if isinstance(result, dict) and isinstance(
+                                        result.get("sessions"), list
+                                    ):
+                                        live = [
+                                            s
+                                            for s in result["sessions"]
+                                            if isinstance(s, dict)
+                                        ]
+                                    if not await _answer_list_request(websocket, req_id, live):
+                                        log(
+                                            "session/list: late answer from %s dropped",
+                                            agent.id,
+                                        )
+                                    continue
                                 await _send_json(websocket, tagged)
                             except json.JSONDecodeError:
                                 await websocket.send(raw)
@@ -828,7 +946,24 @@ async def run_daemon():
                                 cwd = info.get("cwd", "")
                                 method = info.get("method", "")
                                 tagged = _tag_agent_response(data, agent, session_cwd=cwd, session_method=method)
-                                await _send_json(websocket, tagged)
+                                if method == "session/list" and req_id and req_id in _list_pending:
+                                    live = None
+                                    result = tagged.get("result")
+                                    if isinstance(result, dict) and isinstance(
+                                        result.get("sessions"), list
+                                    ):
+                                        live = [
+                                            s
+                                            for s in result["sessions"]
+                                            if isinstance(s, dict)
+                                        ]
+                                    if not await _answer_list_request(websocket, req_id, live):
+                                        log(
+                                            "session/list: late answer from %s dropped",
+                                            agent.id,
+                                        )
+                                else:
+                                    await _send_json(websocket, tagged)
                             except json.JSONDecodeError:
                                 await websocket.send(raw)
                     log("%s agent_to_relay: stdout pipe closed", agent.id)

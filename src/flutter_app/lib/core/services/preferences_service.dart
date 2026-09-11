@@ -13,6 +13,7 @@ class PreferencesService {
   static const _keyThemeMode = 'theme_mode';
   static const _keyDeletedIds = 'deleted_session_ids';
   static const _keyMcpServers = 'mcp_servers';
+  static const _keyConfigChoices = 'config_choices';
 
   final SharedPreferences _prefs;
 
@@ -65,6 +66,38 @@ class PreferencesService {
   Future<void> setMcpServers(List<McpServer> servers) async {
     final raw = jsonEncode(servers.map((s) => s.toJson()).toList());
     await _prefs.setString(_keyMcpServers, raw);
+  }
+
+  /// Per-agent config choices (e.g. selected model), as
+  /// `{agentId: {configId: value}}`. Used to re-apply the user's last
+  /// model/mode pick whenever the agent reports fresh (default) configs.
+  Map<String, String> getConfigChoices(String agentId) {
+    final raw = _prefs.getString(_keyConfigChoices);
+    if (raw == null) return {};
+    try {
+      final all = jsonDecode(raw) as Map<String, dynamic>;
+      final agent = all[agentId] as Map<String, dynamic>?;
+      if (agent == null) return {};
+      return agent.map((k, v) => MapEntry(k, v as String));
+    } catch (_) {
+      return {};
+    }
+  }
+
+  Future<void> setConfigChoice(
+      String agentId, String configId, String value) async {
+    Map<String, dynamic> all = {};
+    final raw = _prefs.getString(_keyConfigChoices);
+    if (raw != null) {
+      try {
+        all = Map<String, dynamic>.from(jsonDecode(raw) as Map);
+      } catch (_) {}
+    }
+    final agent =
+        Map<String, dynamic>.from(all[agentId] as Map? ?? <String, dynamic>{});
+    agent[configId] = value;
+    all[agentId] = agent;
+    await _prefs.setString(_keyConfigChoices, jsonEncode(all));
   }
 
   Future<void> clearAll() async {

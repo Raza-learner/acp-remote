@@ -73,8 +73,12 @@ class MockConnectionNotifier extends ConnectionNotifier {
     return ++_counter;
   }
 
+  final sentMessages = <Map<String, dynamic>>[];
+
   @override
-  void sendRaw(Map<String, dynamic> message) {}
+  void sendRaw(Map<String, dynamic> message) {
+    sentMessages.add(message);
+  }
 
   void injectMessage(Map<String, dynamic> msg) {
     _messageCtrl.add(msg);
@@ -220,6 +224,182 @@ void main() {
       final state = container.read(chatProvider(('test-session', '/home')));
       expect(state.valueOrNull!.configOptions, isEmpty);
       expect(state.valueOrNull!.currentModel, isNull);
+
+      container.dispose();
+    });
+
+    test('ignores sessionId-less configOptions for another request', () async {
+      // Regression: opencode's session/load result (no sessionId field) was
+      // applied to every open chat, so opencode models showed in cursor's
+      // model sheet. Responses that don't name our session AND don't answer
+      // one of our pending requests must be ignored.
+      final container = createContainer();
+      container.read(activeSessionsProvider);
+      container.read(chatProvider(('test-session', '/home')));
+
+      await Future.delayed(const Duration(milliseconds: 100));
+
+      final mock = container.read(connectionProvider.notifier)
+          as MockConnectionNotifier;
+      mock.injectMessage({
+        'id': 9999,
+        'result': {
+          'configOptions': [
+            {
+              'id': 'model',
+              'name': 'Model',
+              'category': 'model',
+              'currentValue': 'leaked-model',
+              'options': [
+                {'value': 'leaked-model', 'name': 'Leaked Model'},
+              ],
+            },
+          ],
+        },
+      });
+
+      await Future.delayed(Duration.zero);
+
+      final state = container.read(chatProvider(('test-session', '/home')));
+      expect(state.valueOrNull!.configOptions, isEmpty);
+      expect(state.valueOrNull!.currentModel, isNull);
+
+      container.dispose();
+    });
+
+    test('applies sessionId-less configOptions from own load response',
+        () async {
+      // Agents may omit sessionId from new/load results; as long as the
+      // response answers OUR pending load request it belongs to us.
+      final container = createContainer();
+      container.read(activeSessionsProvider);
+      container.read(chatProvider(('test-session', '/home')));
+
+      await Future.delayed(const Duration(milliseconds: 100));
+
+      final mock = container.read(connectionProvider.notifier)
+          as MockConnectionNotifier;
+      // Mock loadSession() returns 101 for the first call, which the
+      // ChatNotifier issues on construction and tracks as pending.
+      mock.injectMessage({
+        'id': 101,
+        'result': {
+          'configOptions': [
+            {
+              'id': 'model',
+              'name': 'Model',
+              'category': 'model',
+              'currentValue': 'own-model',
+              'options': [
+                {'value': 'own-model', 'name': 'Own Model'},
+              ],
+            },
+          ],
+        },
+      });
+
+      await Future.delayed(const Duration(milliseconds: 100));
+
+      final state = container.read(chatProvider(('test-session', '/home')));
+      expect(state.valueOrNull!.configOptions.length, 1);
+      expect(state.valueOrNull!.currentModel, 'own-model');
+
+      container.dispose();
+    });
+
+    test('persists model choice and reapplies it on fresh configs', () async {
+      final container = createContainer();
+      container.read(activeSessionsProvider);
+      final mock = container.read(connectionProvider.notifier)
+          as MockConnectionNotifier;
+      mock.state = mock.state.copyWith(selectedAgentId: 'cursor');
+      final notifier = container.read(
+        chatProvider(('test-session', '/home')).notifier,
+      );
+
+      await Future.delayed(const Duration(milliseconds: 100));
+
+      Map<String, dynamic> modelResult(String current) => {
+            'result': {
+              'sessionId': 'test-session',
+              'configOptions': [
+                {
+                  'id': 'model',
+                  'name': 'Model',
+                  'category': 'model',
+                  'currentValue': current,
+                  'options': [
+                    {'value': 'cursor-default', 'name': 'Default'},
+                    {'value': 'my-model', 'name': 'My Model'},
+                  ],
+                },
+              ],
+            },
+          };
+
+      mock.injectMessage(modelResult('cursor-default'));
+      await Future.delayed(const Duration(milliseconds: 100));
+
+      await notifier.setConfigOption('model', 'my-model');
+      expect(
+        container
+            .read(chatProvider(('test-session', '/home')))
+            .valueOrNull!
+            .currentModel,
+        'my-model',
+      );
+
+      // Agent reports defaults again (fresh load) — saved pick must win.
+      mock.sentMessages.clear();
+      mock.injectMessage(modelResult('cursor-default'));
+      await Future.delayed(const Duration(milliseconds: 200));
+
+      final resent = mock.sentMessages.where(
+        (m) =>
+            m['method'] == 'session/set_config_option' &&
+            (m['params'] as Map)['value'] == 'my-model',
+      );
+      expect(resent, isNotEmpty);
+      expect(
+        container
+            .read(chatProvider(('test-session', '/home')))
+            .valueOrNull!
+            .currentModel,
+        'my-model',
+      );
+
+      // A saved pick the agent no longer offers must NOT be re-sent.
+      mock.sentMessages.clear();
+      mock.injectMessage({
+        'result': {
+          'sessionId': 'test-session',
+          'configOptions': [
+            {
+              'id': 'model',
+              'name': 'Model',
+              'category': 'model',
+              'currentValue': 'brand-new',
+              'options': [
+                {'value': 'brand-new', 'name': 'Brand New'},
+              ],
+            },
+          ],
+        },
+      });
+      await Future.delayed(const Duration(milliseconds: 200));
+
+      expect(
+        mock.sentMessages
+            .where((m) => m['method'] == 'session/set_config_option'),
+        isEmpty,
+      );
+      expect(
+        container
+            .read(chatProvider(('test-session', '/home')))
+            .valueOrNull!
+            .currentModel,
+        'brand-new',
+      );
 
       container.dispose();
     });
