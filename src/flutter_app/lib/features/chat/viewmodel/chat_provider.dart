@@ -11,6 +11,7 @@ import '../../../core/models/assistant_segment.dart';
 import '../../../core/providers/connection_provider.dart';
 import '../../../core/providers/database_provider.dart';
 import '../../../core/providers/session_list_provider.dart';
+import '../../../core/providers/usage_provider.dart';
 import '../../../core/models/connection_state.dart';
 
 class ConfigOption {
@@ -188,6 +189,17 @@ class ChatNotifier extends StateNotifier<AsyncValue<ChatState>> {
   String? _timeoutMessageId;
   List<ConfigOption>? _pendingConfigs;
   Timer? _streamingTimer;
+
+  // Accumulated usage for the local /usage answer. Context figures come
+  // from usage_update frames; token totals from prompt-result usage.
+  int? _ctxUsed;
+  int? _ctxSize;
+  num? _costAmount;
+  String? _costCurrency;
+  int _sessInput = 0;
+  int _sessOutput = 0;
+  int _sessCached = 0;
+  bool _hasSessionUsage = false;
 
   /// Tracks whether the WebSocket connection is still alive. When the
   /// connection drops we cancel timers and skip work to avoid triggering
@@ -514,6 +526,16 @@ class ChatNotifier extends StateNotifier<AsyncValue<ChatState>> {
             _timeoutMessageId = null;
           }
 
+          // Accumulate token usage from OUR prompt responses so /usage can
+          // answer locally for every agent.
+          if (!wasLoad) {
+            final res = msg['result'];
+            if (res is Map<String, dynamic>) {
+              final usage = res['usage'];
+              if (usage is Map) _accumulatePromptUsage(usage);
+            }
+          }
+
           _finalizeStreaming();
           _ref.read(activeSessionsProvider.notifier).markInactive(_sessionId);
           if (!wasLoad) {
@@ -657,6 +679,32 @@ class ChatNotifier extends StateNotifier<AsyncValue<ChatState>> {
         }
         break;
       case 'usage_update':
+        // Context-window usage shaped like
+        // {"used": 8072, "size": 200000, "cost": {"amount": 0, "currency": "USD"}}.
+        // Stored so /usage can answer locally for every agent.
+        _ctxUsed = (update['used'] as num?)?.toInt() ?? _ctxUsed;
+        _ctxSize = (update['size'] as num?)?.toInt() ?? _ctxSize;
+        final cost = update['cost'];
+        if (cost is Map) {
+          _costAmount = (cost['amount'] as num?) ?? _costAmount;
+          final currency = cost['currency'] as String?;
+          if (currency != null && currency.isNotEmpty) {
+            _costCurrency = currency;
+          }
+        }
+        // Mirror into the central tracker for the Settings/chip surfaces.
+        final usageAgentId = _agentIdForSession;
+        if (usageAgentId != null) {
+          try {
+            _ref.read(usageTrackerProvider.notifier).reportContext(
+                  usageAgentId,
+                  used: _ctxUsed,
+                  size: _ctxSize,
+                  costAmount: _costAmount,
+                  costCurrency: _costCurrency,
+                );
+          } catch (_) {}
+        }
         break;
       default:
         debugPrint('[ACP-CHAT] unhandled update type: $type');
@@ -838,6 +886,7 @@ class ChatNotifier extends StateNotifier<AsyncValue<ChatState>> {
   }
 
   Future<void> sendMessage(String text, {List<Map<String, dynamic>>? extra}) async {
+    if (await _answerLocalCommand(text)) return;
     final connection = _ref.read(connectionProvider);
     final notifier = _ref.read(connectionProvider.notifier);
 
@@ -916,9 +965,176 @@ class ChatNotifier extends StateNotifier<AsyncValue<ChatState>> {
     });
   }
 
-  /// Agent that owns this session, for per-agent preference keys.
-  /// Falls back to the currently selected agent when the session list
-  /// doesn't know this session (e.g. tests).
+  /// Stop the in-flight agent response: sends `session/cancel` and resets
+  /// local busy state immediately (drops pending prompt ids, finalizes
+  /// streaming, clears the "working..." notice). The session load id is
+  /// kept — cancelling a prompt must not break session loading.
+  Future<void> cancelResponse() async {
+    final notifier = _ref.read(connectionProvider.notifier);
+    final connection = _ref.read(connectionProvider);
+
+    notifier.sendRaw({
+      'jsonrpc': '2.0',
+      'id': DateTime.now().millisecondsSinceEpoch,
+      'method': 'session/cancel',
+      'params': {
+        if (connection.selectedAgentId != null)
+          'agentId': connection.selectedAgentId,
+        'sessionId': _sessionId,
+      },
+    });
+
+    _pendingIds.removeWhere((id) => id != _loadPendingId);
+    if (_timeoutMessageId != null) {
+      _buffer.removeWhere((m) => m.id == _timeoutMessageId);
+      _timeoutMessageId = null;
+    }
+    _streamingTimer?.cancel();
+    _doFinalizeStreaming();
+    if (_loaded) _syncState();
+    debugPrint('[chat_provider] cancel sent for session=$_sessionId');
+  }
+
+  void _accumulatePromptUsage(Map usage) {
+    final input = (usage['inputTokens'] as num?)?.toInt() ?? 0;
+    final output = (usage['outputTokens'] as num?)?.toInt() ?? 0;
+    final cached = (usage['cachedReadTokens'] as num?)?.toInt() ?? 0;
+    if (input == 0 && output == 0 && cached == 0) return;
+    _sessInput += input;
+    _sessOutput += output;
+    _sessCached += cached;
+    _hasSessionUsage = true;
+    final usageAgentId = _agentIdForSession;
+    if (usageAgentId != null) {
+      try {
+        _ref
+            .read(usageTrackerProvider.notifier)
+            .reportPromptUsage(usageAgentId,
+                input: input, output: output, cached: cached);
+      } catch (_) {}
+    }
+  }
+
+  static final _commandToken = RegExp(r'^/[A-Za-z][A-Za-z0-9_-]*$');
+
+  /// Answers locally-handled slash commands. Returns true when the message
+  /// was consumed (not sent to the agent).
+  ///
+  /// Only `/usage` is local today: most agents don't define it (cursor has
+  /// 26 skill commands but no usage; claude/opencode report usage via
+  /// usage_update frames instead), so answering from accumulated usage
+  /// data works uniformly without burning quota on an LLM round-trip.
+  /// Everything else is forwarded untouched — agents also execute
+  /// unadvertised native built-ins (e.g. opencode's /models, /help).
+  Future<bool> _answerLocalCommand(String text) async {
+    final trimmed = text.trim();
+    if (!trimmed.startsWith('/')) return false;
+    final first = trimmed.split(RegExp(r'\s+')).first;
+    if (!_commandToken.hasMatch(first) || first != '/usage') return false;
+
+    final userMsg = ChatMessage(
+      id: _uuid.v4(),
+      role: ChatMessageRole.user,
+      content: text,
+      isStreaming: false,
+      createdAt: DateTime.now().millisecondsSinceEpoch,
+    );
+    _buffer.add(userMsg);
+    if (_loaded) _syncState();
+    try {
+      final db = _ref.read(databaseProvider);
+      await db.saveMessage(
+        id: userMsg.id,
+        sessionId: _sessionId,
+        role: 'user',
+        content: text,
+        isStreaming: false,
+        createdAt: userMsg.createdAt,
+      );
+    } catch (e) {
+      debugPrint('[chat_provider] local command user-save error: $e');
+    }
+
+    _buffer.add(ChatMessage(
+      id: _uuid.v4(),
+      role: ChatMessageRole.assistant,
+      content: _buildUsageCard(),
+      isStreaming: false,
+      createdAt: DateTime.now().millisecondsSinceEpoch,
+    ));
+    _saveMessagesToDb();
+    _finalizeStreaming();
+    if (_loaded) _syncState();
+    return true;
+  }
+
+  String _buildUsageCard() {
+    // Prefer the central tracker (survives restarts); fall back to this
+    // session's in-memory figures (e.g. tests, unknown agent).
+    int? ctxUsed = _ctxUsed;
+    int? ctxSize = _ctxSize;
+    num? costAmount = _costAmount;
+    String? costCurrency = _costCurrency;
+    var sessInput = _sessInput;
+    var sessOutput = _sessOutput;
+    var sessCached = _sessCached;
+    var hasSessionUsage = _hasSessionUsage;
+    try {
+      final agentId = _agentIdForSession;
+      final snap =
+          agentId != null ? _ref.read(usageTrackerProvider).byAgent[agentId] : null;
+      if (snap != null && snap.hasData) {
+        ctxUsed = snap.ctxUsed;
+        ctxSize = snap.ctxSize;
+        costAmount = snap.costAmount;
+        costCurrency = snap.costCurrency;
+        sessInput = snap.sessInput;
+        sessOutput = snap.sessOutput;
+        sessCached = snap.sessCached;
+        hasSessionUsage = sessInput > 0 || sessOutput > 0;
+      }
+    } catch (_) {}
+    final lines = <String>['Usage'];
+    if (ctxUsed != null && ctxSize != null && ctxSize > 0) {
+      final pct = ctxUsed / ctxSize * 100;
+      lines.add(
+          'Context: ${_fmtNum(ctxUsed)} / ${_fmtNum(ctxSize)} (${pct.toStringAsFixed(1)}%)');
+    } else if (ctxUsed != null) {
+      lines.add('Context used: ${_fmtNum(ctxUsed)}');
+    }
+    if (hasSessionUsage) {
+      lines.add(
+          'Session: ${_fmtNum(sessInput)} in · ${_fmtNum(sessOutput)} out · ${_fmtNum(sessInput + sessOutput)} total');
+      if (sessCached > 0) {
+        lines.add('Cached reads: ${_fmtNum(sessCached)}');
+      }
+    }
+    if (costAmount != null) {
+      final currency = costCurrency ?? '';
+      lines.add(
+          currency == 'USD' ? 'Cost: \$$costAmount' : 'Cost: $costAmount $currency'.trim());
+    }
+    if (lines.length == 1) {
+      return 'No usage data yet — the agent reports usage as it works. Send a message first, then try /usage again.';
+    }
+    return lines.join('\n');
+  }
+
+  String _fmtNum(int n) {
+    final s = n.toString();
+    final buf = StringBuffer();
+    for (var i = 0; i < s.length; i++) {
+      if (i > 0 && (s.length - i) % 3 == 0) buf.write(',');
+      buf.write(s[i]);
+    }
+    return buf.toString();
+  }
+
+  /// Agent that owns this session, for per-agent preference keys and the
+  /// usage tracker. Falls back to the currently selected agent when the
+  /// session list doesn't know this session (e.g. tests).
+  String? get agentIdForSession => _agentIdForSession;
+
   String? get _agentIdForSession {
     try {
       final sessions = _ref.read(sessionListProvider).valueOrNull;

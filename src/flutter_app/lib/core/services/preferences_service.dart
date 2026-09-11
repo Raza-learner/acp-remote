@@ -14,6 +14,8 @@ class PreferencesService {
   static const _keyDeletedIds = 'deleted_session_ids';
   static const _keyMcpServers = 'mcp_servers';
   static const _keyConfigChoices = 'config_choices';
+  static const _keyUsageSnapshots = 'usage_snapshots';
+  static const _keyUsageWarnPct = 'usage_warn_pct';
 
   final SharedPreferences _prefs;
 
@@ -82,6 +84,33 @@ class PreferencesService {
     } catch (_) {
       return {};
     }
+  }
+
+  /// Per-agent usage snapshots for the Usage UI. Never throws.
+  Map<String, Map<String, dynamic>> getUsageSnapshots() {
+    final raw = _prefs.getString(_keyUsageSnapshots);
+    if (raw == null) return {};
+    try {
+      final all = jsonDecode(raw) as Map<String, dynamic>;
+      return all.map((k, v) => MapEntry(
+          k, Map<String, dynamic>.from(v as Map? ?? <String, dynamic>{})));
+    } catch (_) {
+      return {};
+    }
+  }
+
+  Future<void> setUsageSnapshots(
+      Map<String, Map<String, dynamic>> snapshots) async {
+    try {
+      await _prefs.setString(_keyUsageSnapshots, jsonEncode(snapshots));
+    } catch (_) {}
+  }
+
+  /// Context-usage warning threshold in percent. 0 means off.
+  int getUsageWarnPct() => _prefs.getInt(_keyUsageWarnPct) ?? 80;
+
+  Future<void> setUsageWarnPct(int pct) async {
+    await _prefs.setInt(_keyUsageWarnPct, pct);
   }
 
   Future<void> setConfigChoice(

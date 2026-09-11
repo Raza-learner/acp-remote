@@ -13,6 +13,7 @@ import 'package:acp_remote/core/models/connection_state.dart';
 import 'package:acp_remote/core/providers/connection_provider.dart';
 import 'package:acp_remote/core/providers/database_provider.dart';
 import 'package:acp_remote/core/providers/session_list_provider.dart';
+import 'package:acp_remote/core/providers/usage_provider.dart';
 import 'package:acp_remote/features/chat/viewmodel/chat_provider.dart';
 
 class _FakeSink implements WebSocketSink {
@@ -59,12 +60,15 @@ class MockConnectionNotifier extends ConnectionNotifier {
   @override
   Stream<Map<String, dynamic>> get messages => _messageCtrl.stream;
 
+  final sentPrompts = <Map<String, dynamic>>[];
+
   @override
   int sendSessionMessage(
     String sessionId,
     String text, {
     List<Map<String, dynamic>>? extra,
   }) {
+    sentPrompts.add({'sessionId': sessionId, 'text': text});
     return ++_counter;
   }
 
@@ -91,6 +95,13 @@ class MockConnectionNotifier extends ConnectionNotifier {
   }
 }
 
+class _NoopSessionList extends SessionListNotifier {
+  _NoopSessionList(super.ref);
+
+  @override
+  Future<void> loadSessions() async {}
+}
+
 void main() {
   late AppDatabase db;
 
@@ -103,12 +114,17 @@ void main() {
     await db.close();
   });
 
-  ProviderContainer createContainer() {
+  ProviderContainer createContainer({bool noopSessionList = false}) {
     return ProviderContainer(overrides: [
       databaseProvider.overrideWith((ref) => db),
       connectionProvider.overrideWith((ref) {
         return MockConnectionNotifier(ref);
       }),
+      // Prompt responses trigger a background session-list refresh (5s
+      // timeout); neutralize it in tests that inject prompt responses so
+      // no timers/state writes outlive the container.
+      if (noopSessionList)
+        sessionListProvider.overrideWith((ref) => _NoopSessionList(ref)),
     ]);
   }
 
@@ -400,6 +416,195 @@ void main() {
             .currentModel,
         'brand-new',
       );
+
+      container.dispose();
+    });
+
+    test('cancelResponse sends session/cancel and clears busy', () async {
+      final container = createContainer();
+      container.read(activeSessionsProvider);
+      final notifier = container.read(
+        chatProvider(('test-session', '/home')).notifier,
+      );
+
+      await Future.delayed(const Duration(milliseconds: 100));
+
+      await notifier.sendMessage('hello');
+      expect(
+        container
+            .read(chatProvider(('test-session', '/home')))
+            .valueOrNull!
+            .isBusy,
+        isTrue,
+      );
+
+      final mock = container.read(connectionProvider.notifier)
+          as MockConnectionNotifier;
+      mock.sentMessages.clear();
+      await notifier.cancelResponse();
+
+      final cancel = mock.sentMessages.where(
+        (m) => m['method'] == 'session/cancel',
+      );
+      expect(cancel, isNotEmpty);
+      expect(
+        (cancel.first['params'] as Map)['sessionId'],
+        'test-session',
+      );
+      expect(
+        container
+            .read(chatProvider(('test-session', '/home')))
+            .valueOrNull!
+            .isBusy,
+        isFalse,
+      );
+
+      container.dispose();
+    });
+
+    test('/usage answers locally from reported usage', () async {
+      final container = createContainer(noopSessionList: true);
+      container.read(activeSessionsProvider);
+      final notifier = container.read(
+        chatProvider(('test-session', '/home')).notifier,
+      );
+
+      await Future.delayed(const Duration(milliseconds: 100));
+
+      final mock = container.read(connectionProvider.notifier)
+          as MockConnectionNotifier;
+      mock.injectMessage({
+        'method': 'session/update',
+        'params': {
+          'sessionId': 'test-session',
+          'update': {
+            'sessionUpdate': 'usage_update',
+            'used': 8072,
+            'size': 200000,
+            'cost': {'amount': 0, 'currency': 'USD'},
+          },
+        },
+      });
+      await Future.delayed(Duration.zero);
+
+      // Prompt id 102: 101 is the construction-time loadSession call.
+      await notifier.sendMessage('hello');
+      mock.injectMessage({
+        'id': 102,
+        'result': {
+          'stopReason': 'end_turn',
+          'usage': {
+            'inputTokens': 6216,
+            'outputTokens': 15,
+            'cachedReadTokens': 1856,
+          },
+        },
+      });
+      await Future.delayed(Duration.zero);
+
+      mock.sentPrompts.clear();
+      await notifier.sendMessage('/usage');
+      await Future.delayed(const Duration(milliseconds: 100));
+
+      // No prompt left the phone — answered from accumulated usage data.
+      expect(mock.sentPrompts, isEmpty);
+      final messages =
+          container.read(chatProvider(('test-session', '/home'))).valueOrNull!.messages;
+      expect(messages.last.role, ChatMessageRole.assistant);
+      expect(messages.last.content, contains('8,072 / 200,000'));
+      expect(messages.last.content, contains('6,216 in'));
+      expect(messages.last.content, contains('15 out'));
+      expect(messages.last.content, contains('Cost: \$0'));
+
+      container.dispose();
+    });
+
+    test('usage_update is mirrored into the usage tracker', () async {
+      final container = createContainer(noopSessionList: true);
+      container.read(activeSessionsProvider);
+      container.read(chatProvider(('test-session', '/home')));
+
+      await Future.delayed(const Duration(milliseconds: 100));
+
+      final mock = container.read(connectionProvider.notifier)
+          as MockConnectionNotifier;
+      mock.state = mock.state.copyWith(selectedAgentId: 'cursor');
+      mock.injectMessage({
+        'method': 'session/update',
+        'params': {
+          'sessionId': 'test-session',
+          'update': {
+            'sessionUpdate': 'usage_update',
+            'used': 9000,
+            'size': 100000,
+          },
+        },
+      });
+      await Future.delayed(const Duration(milliseconds: 100));
+
+      final snap = container
+          .read(usageTrackerProvider)
+          .byAgent['cursor'];
+      expect(snap, isNotNull);
+      expect(snap!.ctxUsed, 9000);
+      expect(snap.contextFraction, closeTo(0.09, 0.0001));
+
+      container.dispose();
+    });
+
+    test('/usage with no data explains instead of asking the agent', () async {
+      final container = createContainer(noopSessionList: true);
+      container.read(activeSessionsProvider);
+      final notifier = container.read(
+        chatProvider(('test-session', '/home')).notifier,
+      );
+
+      await Future.delayed(const Duration(milliseconds: 100));
+
+      final mock = container.read(connectionProvider.notifier)
+          as MockConnectionNotifier;
+      await notifier.sendMessage('/usage');
+      await Future.delayed(const Duration(milliseconds: 100));
+
+      expect(mock.sentPrompts, isEmpty);
+      final messages =
+          container.read(chatProvider(('test-session', '/home'))).valueOrNull!.messages;
+      expect(messages.last.content, contains('No usage data yet'));
+
+      container.dispose();
+    });
+
+    test('other slash commands still forward to the agent', () async {
+      // Documents the no-regression rule: agents execute unadvertised
+      // native built-ins (e.g. opencode's /models), so only /usage is
+      // ever answered locally.
+      final container = createContainer();
+      container.read(activeSessionsProvider);
+      final notifier = container.read(
+        chatProvider(('test-session', '/home')).notifier,
+      );
+
+      await Future.delayed(const Duration(milliseconds: 100));
+
+      final mock = container.read(connectionProvider.notifier)
+          as MockConnectionNotifier;
+      mock.injectMessage({
+        'method': 'session/update',
+        'params': {
+          'sessionId': 'test-session',
+          'update': {
+            'sessionUpdate': 'available_commands_update',
+            'availableCommands': [
+              {'name': 'review', 'description': 'Review changes'},
+            ],
+          },
+        },
+      });
+      await Future.delayed(Duration.zero);
+
+      await notifier.sendMessage('/models');
+      expect(mock.sentPrompts.length, 1);
+      expect(mock.sentPrompts.first['text'], '/models');
 
       container.dispose();
     });

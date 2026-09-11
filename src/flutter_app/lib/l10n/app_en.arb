@@ -89,6 +89,31 @@
   "@settingsAppearance": {},
   "settingsData": "Data",
   "@settingsData": {},
+  "settingsUsage": "Usage",
+  "@settingsUsage": {},
+  "settingsUsageThreshold": "Warn when context passes",
+  "@settingsUsageThreshold": {},
+  "settingsUsageThresholdOff": "Off",
+  "@settingsUsageThresholdOff": {},
+  "settingsUsageEmpty": "No usage reported yet — figures appear here as your agents work.",
+  "@settingsUsageEmpty": {},
+  "settingsUsageTokens": "tokens",
+  "@settingsUsageTokens": {},
+  "settingsUsageNotReported": "not reported",
+  "@settingsUsageNotReported": {},
+  "settingsUsageOver": "Over {pct}% of context",
+  "@settingsUsageOver": {
+    "placeholders": {
+      "pct": {}
+    }
+  },
+  "settingsUsageContext": "{used} / {size} context",
+  "@settingsUsageContext": {
+    "placeholders": {
+      "used": {},
+      "size": {}
+    }
+  },
   "settingsAbout": "About",
   "@settingsAbout": {},
   "settingsSupport": "Support",

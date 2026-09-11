@@ -14,6 +14,7 @@ import '../../../core/env.dart';
 import '../../../core/providers/connection_provider.dart';
 import '../../../core/providers/preferences_provider.dart';
 import '../../../core/providers/database_provider.dart';
+import '../../../core/providers/usage_provider.dart';
 import '../../../core/models/mcp_server.dart';
 import '../../../core/theme/app_spacing.dart';
 import '../../../shared/widgets/animated_background.dart';
@@ -213,6 +214,10 @@ class SettingsScreen extends ConsumerWidget {
               ],
             ),
           ),
+          const SizedBox(height: AppSpacing.lg),
+          _SectionHeader(title: AppLocalizations.of(context)!.settingsUsage),
+          const SizedBox(height: AppSpacing.sm),
+          const _UsageCard(),
           const SizedBox(height: AppSpacing.lg),
           _SectionHeader(title: AppLocalizations.of(context)!.settingsData),
           const SizedBox(height: AppSpacing.sm),
@@ -589,6 +594,218 @@ class _DiagnosticsCard extends ConsumerWidget {
           );
         },
       ),
+    );
+  }
+}
+
+class _UsageCard extends ConsumerWidget {
+  const _UsageCard();
+
+  String _prettyAgent(String agentId, List<AcpAgent> agents) {
+    for (final a in agents) {
+      if (a.id == agentId) return a.name;
+    }
+    if (agentId.isEmpty) return '?';
+    return agentId[0].toUpperCase() + agentId.substring(1);
+  }
+
+  String _fmt(int n) {
+    final s = n.toString();
+    final buf = StringBuffer();
+    for (var i = 0; i < s.length; i++) {
+      if (i > 0 && (s.length - i) % 3 == 0) buf.write(',');
+      buf.write(s[i]);
+    }
+    return buf.toString();
+  }
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final theme = Theme.of(context);
+    final l10n = AppLocalizations.of(context)!;
+    final usage = ref.watch(usageTrackerProvider);
+    final agents = ref.watch(connectionProvider.select((c) => c.agents));
+    const thresholds = [0, 50, 70, 80, 90];
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(Icons.data_usage_rounded,
+                    size: 20, color: theme.colorScheme.onSurfaceVariant),
+                const SizedBox(width: 16),
+                Expanded(
+                  child: Text(
+                    l10n.settingsUsageThreshold,
+                    style: theme.textTheme.bodyLarge,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: SegmentedButton<int>(
+                segments: [
+                  ButtonSegment(
+                    value: 0,
+                    label: Text(l10n.settingsUsageThresholdOff),
+                  ),
+                  for (final t in thresholds.skip(1))
+                    ButtonSegment(
+                      value: t,
+                      label: Text('$t%'),
+                    ),
+                ],
+                selected: {usage.warnPct},
+                showSelectedIcon: false,
+                onSelectionChanged: (set) {
+                  ref.read(usageTrackerProvider.notifier).setWarnPct(set.first);
+                },
+              ),
+            ),
+            const Divider(height: 24),
+            if (usage.byAgent.isEmpty)
+              Row(
+                children: [
+                  Icon(Icons.info_outline,
+                      size: 20, color: theme.colorScheme.onSurfaceVariant),
+                  const SizedBox(width: 16),
+                  Expanded(
+                    child: Text(
+                      l10n.settingsUsageEmpty,
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ),
+                ],
+              )
+            else
+              for (final entry in usage.byAgent.entries) ...[
+                _AgentUsageRow(
+                  name: _prettyAgent(entry.key, agents),
+                  snapshot: entry.value,
+                  over: ref
+                      .read(usageTrackerProvider.notifier)
+                      .isOverThreshold(entry.key),
+                  warnPct: usage.warnPct,
+                  format: _fmt,
+                ),
+                const SizedBox(height: 12),
+              ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _AgentUsageRow extends StatelessWidget {
+  final String name;
+  final AgentUsage snapshot;
+  final bool over;
+  final int warnPct;
+  final String Function(int) format;
+
+  const _AgentUsageRow({
+    required this.name,
+    required this.snapshot,
+    required this.over,
+    required this.warnPct,
+    required this.format,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final l10n = AppLocalizations.of(context)!;
+    final fraction = snapshot.contextFraction;
+    final barColor = over
+        ? theme.colorScheme.error
+        : theme.colorScheme.primary;
+
+    final detail = <String>[];
+    if (snapshot.sessInput > 0 || snapshot.sessOutput > 0) {
+      detail.add(
+          '${format(snapshot.sessInput + snapshot.sessOutput)} ${l10n.settingsUsageTokens}');
+    }
+    if (snapshot.costAmount != null) {
+      final cur = snapshot.costCurrency ?? '';
+      detail.add(cur == 'USD'
+          ? '\$${snapshot.costAmount}'
+          : '${snapshot.costAmount} $cur'.trim());
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Text(name,
+                  style: theme.textTheme.bodyLarge
+                      ?.copyWith(fontWeight: FontWeight.w500)),
+            ),
+            if (fraction != null)
+              Text(
+                '${(fraction * 100).toStringAsFixed(1)}%',
+                style: theme.textTheme.bodyMedium?.copyWith(
+                  color: over
+                      ? theme.colorScheme.error
+                      : theme.colorScheme.onSurfaceVariant,
+                  fontWeight: over ? FontWeight.w600 : null,
+                ),
+              )
+            else if (!snapshot.hasData)
+              Text(
+                l10n.settingsUsageNotReported,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+          ],
+        ),
+        if (fraction != null) ...[
+          const SizedBox(height: 6),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(4),
+            child: LinearProgressIndicator(
+              value: fraction,
+              minHeight: 6,
+              backgroundColor:
+                  theme.colorScheme.surfaceContainerHighest,
+              valueColor: AlwaysStoppedAnimation<Color>(barColor),
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            over
+                ? l10n.settingsUsageOver(warnPct)
+                : l10n.settingsUsageContext(
+                    format(snapshot.ctxUsed ?? 0),
+                    format(snapshot.ctxSize ?? 0)),
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: over
+                  ? theme.colorScheme.error
+                  : theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+        if (detail.isNotEmpty) ...[
+          const SizedBox(height: 2),
+          Text(
+            detail.join(' · '),
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+      ],
     );
   }
 }

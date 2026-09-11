@@ -322,6 +322,54 @@ abstract class AppLocalizations {
   /// **'Data'**
   String get settingsData;
 
+  /// No description provided for @settingsUsage.
+  ///
+  /// In en, this message translates to:
+  /// **'Usage'**
+  String get settingsUsage;
+
+  /// No description provided for @settingsUsageThreshold.
+  ///
+  /// In en, this message translates to:
+  /// **'Warn when context passes'**
+  String get settingsUsageThreshold;
+
+  /// No description provided for @settingsUsageThresholdOff.
+  ///
+  /// In en, this message translates to:
+  /// **'Off'**
+  String get settingsUsageThresholdOff;
+
+  /// No description provided for @settingsUsageEmpty.
+  ///
+  /// In en, this message translates to:
+  /// **'No usage reported yet — figures appear here as your agents work.'**
+  String get settingsUsageEmpty;
+
+  /// No description provided for @settingsUsageTokens.
+  ///
+  /// In en, this message translates to:
+  /// **'tokens'**
+  String get settingsUsageTokens;
+
+  /// No description provided for @settingsUsageNotReported.
+  ///
+  /// In en, this message translates to:
+  /// **'not reported'**
+  String get settingsUsageNotReported;
+
+  /// No description provided for @settingsUsageOver.
+  ///
+  /// In en, this message translates to:
+  /// **'Over {pct}% of context'**
+  String settingsUsageOver(Object pct);
+
+  /// No description provided for @settingsUsageContext.
+  ///
+  /// In en, this message translates to:
+  /// **'{used} / {size} context'**
+  String settingsUsageContext(Object used, Object size);
+
   /// No description provided for @settingsAbout.
   ///
   /// In en, this message translates to:

@@ -138,6 +138,35 @@ class AppLocalizationsEn extends AppLocalizations {
   String get settingsData => 'Data';
 
   @override
+  String get settingsUsage => 'Usage';
+
+  @override
+  String get settingsUsageThreshold => 'Warn when context passes';
+
+  @override
+  String get settingsUsageThresholdOff => 'Off';
+
+  @override
+  String get settingsUsageEmpty =>
+      'No usage reported yet — figures appear here as your agents work.';
+
+  @override
+  String get settingsUsageTokens => 'tokens';
+
+  @override
+  String get settingsUsageNotReported => 'not reported';
+
+  @override
+  String settingsUsageOver(Object pct) {
+    return 'Over $pct% of context';
+  }
+
+  @override
+  String settingsUsageContext(Object used, Object size) {
+    return '$used / $size context';
+  }
+
+  @override
   String get settingsAbout => 'About';
 
   @override

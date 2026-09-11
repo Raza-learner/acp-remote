@@ -11,6 +11,8 @@ import 'package:go_router/go_router.dart';
 import '../viewmodel/chat_provider.dart';
 import '../../../core/providers/connection_provider.dart';
 import '../../../core/providers/session_list_provider.dart';
+import '../../../core/providers/usage_provider.dart';
+import '../../../../l10n/app_localizations.dart';
 import '../../../core/demo/demo_mode.dart';
 import '../../../core/demo/demo_data.dart';
 import '../../../core/theme/app_spacing.dart';
@@ -1066,19 +1068,18 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                                 ),
                                 child: isBusy
                                     ? IconButton.filled(
-                                        key: const ValueKey('busy'),
-                                        onPressed: null,
-                                        icon: SizedBox(
-                                          width: 18,
-                                          height: 18,
-                                          child: CircularProgressIndicator(
-                                            strokeWidth: 2.5,
-                                            color: t.colorScheme.primary,
-                                          ),
-                                        ),
+                                        key: const ValueKey('stop'),
+                                        tooltip: 'Stop response',
+                                        onPressed: () => ref
+                                            .read(chatProvider((
+                                              widget.sessionId,
+                                              widget.cwd))
+                                                .notifier)
+                                            .cancelResponse(),
+                                        icon: const Icon(Icons.stop_rounded, size: 22),
                                         style: IconButton.styleFrom(
-                                          backgroundColor: t.colorScheme.surfaceContainerHighest,
-                                          foregroundColor: t.colorScheme.primary,
+                                          backgroundColor: t.colorScheme.errorContainer,
+                                          foregroundColor: t.colorScheme.onErrorContainer,
                                         ),
                                       )
                                     : IconButton.filled(
@@ -1298,6 +1299,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                     ),
                   ),
                   const SizedBox(height: AppSpacing.lg),
+                  _SheetUsageBlock(
+                    sessionId: widget.sessionId,
+                    cwd: widget.cwd,
+                  ),
                   ...configOptions.map((opt) {
                     return Padding(
                       padding: const EdgeInsets.only(bottom: AppSpacing.md),
@@ -1356,6 +1361,78 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           ),
         );
       },
+    );
+  }
+}
+
+/// Compact read-only usage glance at the top of the model/config sheet.
+/// Hidden entirely when the agent hasn't reported any usage yet, so the
+/// sheet looks exactly as before for fresh sessions.
+class _SheetUsageBlock extends ConsumerWidget {
+  final String sessionId;
+  final String cwd;
+
+  const _SheetUsageBlock({required this.sessionId, required this.cwd});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final theme = Theme.of(context);
+    final l10n = AppLocalizations.of(context)!;
+    final agentId = ref
+        .read(chatProvider((sessionId, cwd)).notifier)
+        .agentIdForSession;
+    final usage = ref.watch(usageTrackerProvider);
+    final snap = agentId != null ? usage.byAgent[agentId] : null;
+    if (snap == null || !snap.hasData) return const SizedBox.shrink();
+
+    final fraction = snap.contextFraction;
+    final over = agentId != null &&
+        ref.read(usageTrackerProvider.notifier).isOverThreshold(agentId);
+    final barColor =
+        over ? theme.colorScheme.error : theme.colorScheme.primary;
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: AppSpacing.md),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  l10n.settingsUsage,
+                  style: theme.textTheme.labelMedium?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ),
+              if (fraction != null)
+                Text(
+                  '${(fraction * 100).toStringAsFixed(1)}%',
+                  style: theme.textTheme.labelMedium?.copyWith(
+                    color: over
+                        ? theme.colorScheme.error
+                        : theme.colorScheme.onSurfaceVariant,
+                    fontWeight: over ? FontWeight.w600 : null,
+                  ),
+                ),
+            ],
+          ),
+          if (fraction != null) ...[
+            const SizedBox(height: 6),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(4),
+              child: LinearProgressIndicator(
+                value: fraction,
+                minHeight: 6,
+                backgroundColor:
+                    theme.colorScheme.surfaceContainerHighest,
+                valueColor: AlwaysStoppedAnimation<Color>(barColor),
+              ),
+            ),
+          ],
+        ],
+      ),
     );
   }
 }
